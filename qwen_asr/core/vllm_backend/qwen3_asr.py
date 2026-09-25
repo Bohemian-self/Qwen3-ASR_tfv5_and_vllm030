@@ -773,7 +773,33 @@ class Qwen3ASRAudioEncoder(nn.Module):
 
 class Qwen3ASRProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
-        return self.ctx.get_hf_config(Qwen3ASRConfig).thinker_config
+        # vLLM 0.30 在 dummy/profiling 阶段可能拿到的 hf_config 还没映射到 Qwen3ASRConfig，
+        # 此时 .thinker_config 为 None，直接返回会导致后面全用默认值 + prompt 更新错位。
+        # 这里做三级回退：ctx.get_hf_config -> model_config.hf_config -> 原样返回。
+        try:
+            hf = self.ctx.get_hf_config(Qwen3ASRConfig)
+            _th = getattr(hf, "thinker_config", None)
+            if _th is not None:
+                return _th
+        except Exception:
+            hf = None
+        try:
+            mc = getattr(getattr(self.ctx, "model_config", None), "hf_config", None)
+            if mc is not None:
+                _th2 = getattr(mc, "thinker_config", None)
+                if _th2 is not None:
+                    return _th2
+                # model_config 本身可能已经是 thinker 级别
+                if hasattr(mc, "audio_config") and hasattr(mc, "text_config"):
+                    return mc
+        except Exception:
+            pass
+        if hf is not None:
+            return hf
+        raise RuntimeError(
+            "Qwen3ASRProcessingInfo.get_hf_config: cannot resolve thinker_config "
+            "(hf_config missing thinker_config; check AutoConfig.register order)"
+        )
 
     def get_hf_processor(self, **kwargs: object) -> Qwen3ASRProcessor:
         processor = self.ctx.get_hf_processor(
@@ -818,7 +844,7 @@ class Qwen3ASRDummyInputsBuilder(BaseDummyInputsBuilder[Qwen3ASRProcessingInfo])
         num_audios = mm_counts.get("audio", 0)
 
         hf_processor = self.info.get_hf_processor()
-        audio_token = hf_processor.audio_token
+        audio_token = getattr(hf_processor, "audio_token", "<|audio_pad|>") or "<|audio_pad|>"
 
         return audio_token * num_audios
 
@@ -896,10 +922,24 @@ class Qwen3ASRMultiModalProcessor(
     ) -> Sequence[PromptUpdate]:
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
-        vocab = tokenizer.get_vocab()
+        try:
+            vocab = tokenizer.get_vocab()
+        except Exception:
+            vocab = {}
+        audio_token = getattr(processor, "audio_token", "<|audio_pad|>") or "<|audio_pad|>"
 
-        audio_token = processor.audio_token
-        audio_token_id = vocab[audio_token]
+        # vocab 缺键时回退 convert_tokens_to_ids，避免 KeyError 掩盖真正的 prompt 问题
+        try:
+            audio_token_id = vocab[audio_token]
+        except Exception:
+            try:
+                audio_token_id = tokenizer.convert_tokens_to_ids(audio_token)
+            except Exception:
+                audio_token_id = getattr(getattr(self.info.get_hf_config(), "text_config", None), "audio_token_id", 151646)
+                try:
+                    audio_token_id = int(audio_token_id)
+                except Exception:
+                    audio_token_id = 151646
 
         out_mm_data = out_mm_kwargs.get_data()
         audio_feature_lengths = out_mm_data.get("audio_feature_lengths")
@@ -928,10 +968,14 @@ class Qwen3ASRMultiModalProcessor(
 
             return [audio_token_id] * num_features
 
+        # vLLM 0.30 的 PromptUpdate.target 必须是 list[int]，传 str 会在
+        # _iter_text_matches 里走 tokenizer.decode(str) 直接 TypeError:
+        # "Can't extract 'str' to 'Vec' while processing 'ids'"。
+        # 父类 Qwen2_5OmniThinkerMultiModalProcessor 同样用 target=[audio_token_id]。
         return [
             PromptReplacement(
                 modality="audio",
-                target=audio_token,
+                target=[audio_token_id],
                 replacement=get_replacement_qwen2_audio,
             ),
         ]
@@ -969,9 +1013,23 @@ class Qwen3ASRForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.vllm_config = vllm_config  # needed for torch compile forward context
-        thinker_config: Qwen3ASRThinkerConfig = (
-            vllm_config.model_config.hf_config.thinker_config
-        )
+        _hf = vllm_config.model_config.hf_config
+        thinker_config = getattr(_hf, "thinker_config", None)
+        if thinker_config is None:
+            # 兼容 AutoConfig 未注册/远程 config.json 还没解析出 thinker 层级的情形；
+            # 直接用默认 ThinkerConfig 会导致音频 token 数/采样率全错，所以这里显式报错而不是静默默认。
+            # 日志里 "thinker_config is None. Initializing ... default values" 即此分支的旧行为，已改为报错。
+            if hasattr(_hf, "audio_config") and hasattr(_hf, "text_config"):
+                thinker_config = _hf
+            else:
+                raise ValueError(
+                    "vllm_config.model_config.hf_config.thinker_config is None. "
+                    f"got hf_config type={type(_hf).__name__} model_type={getattr(_hf, 'model_type', None)}. "
+                    "请先确保 AutoConfig.register('qwen3_asr', Qwen3ASRConfig) 已执行 "
+                    "(qwen_asr.inference.qwen3_asr / cli.serve 已做安全注册)，"
+                    "且 LLM(model=...) 传入的是 Qwen/Qwen3-ASR-1.7B 这类原生权重，而非 -hf 目录。"
+                )
+        thinker_config: Qwen3ASRThinkerConfig = thinker_config
         quant_config = vllm_config.quant_config
         multimodal_config = vllm_config.model_config.multimodal_config
         self.config = thinker_config

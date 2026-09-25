@@ -3,7 +3,39 @@
 本次已直接修改 `qwenasr_vllm_optimizated/Qwen3-ASR` 源码(保持版本号 0.0.6)，使同一份代码在
 旧版(transformers 4.57/vllm 0.17)与新版(transformers 5.18.dev0/vllm 0.30)都能 import。
 
-## 改了哪些文件
+## 2026-09-25 追补：vLLM 0.30 运行时 `Can't extract 'str' to 'Vec'` 修复
+
+报错链：`Qwen3ASRModel.LLM -> vLLM init -> get_dummy_mm_inputs -> processor.apply
+-> _maybe_apply_prompt_updates(vllm/model_executor/models/qwen3_omni_moe_thinker.py:1357)
+-> _apply_prompt_updates_via_text -> _plan_prompt_updates_with -> _find_queue_match
+-> _iter_text_matches -> tokenizer.decode(target) -> TypeError: Can't extract 'str' to 'Vec'`
+
+根因：vLLM 0.30 的 `PromptUpdate.target` 类型为 `list[int] | PromptIndex`
+(`vllm/multimodal/processing/processor.py`)，`_iter_text_matches` 内会对 target 做
+`tokenizer.decode(target)`。旧 `qwen-asr` 传 `target=audio_token(str)`，
+decode(str) 直接炸；父类 `Qwen2_5OmniThinkerMultiModalProcessor` 正确写法是
+`target=[audio_token_id]`。
+
+本次修复（`qwen_asr/core/vllm_backend/qwen3_asr.py`）：
+- `_get_prompt_updates` 的 `PromptReplacement(target=audio_token)` → `target=[audio_token_id]`，
+  `replacement` 保持返回 `[audio_token_id]*num_features` 不变；
+- `audio_token_id` 解析加回退：`vocab[]` → `convert_tokens_to_ids` → `config.audio_token_id(151646)`；
+- `get_hf_config()` 三级回退并在 `thinker_config is None` 时显式报错，
+  替代旧的静默默认（旧日志 `thinker_config is None. Initializing ... default values` 会导致
+  音频 token 数/采样率全错后再在 prompt 更新处连环炸）；
+- `Qwen3ASRForConditionalGeneration.__init__` 对 `hf_config.thinker_config is None` 显式报错，
+  提示先执行 `AutoConfig.register('qwen3_asr', Qwen3ASRConfig)` 且用原生权重 ID；
+- `get_dummy_text/get_hf_processor` 的 `audio_token` 加 `getattr` 回退。
+
+Kaggle/服务器注意：你报错栈里加载的是 `/usr/local/lib/python3.12/dist-packages/qwen_asr`
+（PyPI 旧包），不是本仓库补丁。必须先卸载旧包再以 `--no-deps` 装本仓库，否则改了也不生效：
+```bash
+pip uninstall -y qwen-asr
+pip install --no-deps -e /path/to/Qwen3-ASR
+# 或 pip install --no-deps /path/to/Qwen3-ASR
+```
+
+## 改了哪些文件（初版）
 
 1. `pyproject.toml`
    - `transformers~=4.57.6` -> `transformers>=4.57.6`，`torch>=2.4`，`vllm>=0.17`
