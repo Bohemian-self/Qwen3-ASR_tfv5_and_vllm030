@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-asr"
+version = "0.0.6"
+description = "Qwen-ASR python package"
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+license = { text = "Apache-2.0" }
+authors = [{ name = "Alibaba Qwen Team" }]
+
+dependencies = [
+  # 兼容 transformers 4.57.6 (官方) ~ 5.18.0.dev0 (新)。
+  # 旧代码的 = =  pin 会直接阻止安装新版，改为下限约束 + 代码内做 API 兼容。
+  "transformers>=4.57.6",
+  "nagisa>=0.2.11",
+  "soynlp>=0.0.493",
+  "accelerate>=1.12.0",
+  # torch 2.13.0 已验证可用；这里只设下限，不锁死 CUDA 构建。
+  "torch>=2.4",
+  "qwen-omni-utils",
+  "librosa",
+  "soundfile",
+  "sox",
+  "gradio",
+  "flask",
+  "pytz",
+]
+
+[project.optional-dependencies]
+vllm = [
+  # 兼容 vllm 0.17 (旧 qwen-asr 优化分支) ~ 0.30.0 (新)。
+  # vllm 0.16+ multimodal processor API 大改，0.30 config/registry 路径又有搬家，
+  # 已在 qwen_asr/core/vllm_backend/qwen3_asr.py 内做 try/except 兼容。
+  "vllm>=0.17",
+]
+
+[project.urls]
+Homepage = "https://github.com/Qwen/Qwen3-ASR"
+Repository = "https://github.com/Qwen/Qwen3-ASR"
+
+[project.scripts]
+qwen-asr-demo = "qwen_asr.cli.demo:main"
+qwen-asr-demo-streaming = "qwen_asr.cli.demo_streaming:main"
+qwen-asr-serve = "qwen_asr.cli.serve:main"
+
+[tool.setuptools]
+packages = { find = { where = ["."] , include = ["qwen_asr*"] } }
+include-package-data = true
+
+[tool.setuptools.package-data]
+qwen_asr = ["py.typed", "**/*.dict"]
+# 兼容旧拼写(上游 typo)，避免已发布包缺 assets/korean_dict_jieba.dict
+qwen_tts = ["py.typed", "**/*.dict"]
